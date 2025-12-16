@@ -39,41 +39,108 @@ data_t requantize(acc_t acc, bias_t bias, mult_t mult, shift_t shift, data_t zp_
 }
 
 // Depthwise Convolution (无 Bias 的情况通过传入全0数组处理)
-void depthwise_conv(
+template<int IN_H, int IN_W, int C, int K>
+void depthwise_conv_opt(
     data_t* input, 
     data_t* output,
     const int8_t* weight, 
-    const int32_t* bias,  // 这里传入上面定义的 zeros 数组
+    const int32_t* bias, 
     const int32_t* mult, 
     const int32_t* shift, 
     data_t zp_out,
-    int in_h, int in_w, int c, int k, 
     data_t zp_in,
     int8_t weight_zp
 ) {
-    int out_h = in_h - k + 1; // 128 - 9 + 1 = 120
-    int out_w = in_w - k + 1;
+    // 1. 定义 Line Buffer 和 Window Buffer
+    // Line Buffer 存储 K-1 行，用于垂直方向的数据重用
+    static data_t line_buffer[K-1][IN_W];
+    #pragma HLS ARRAY_PARTITION variable=line_buffer dim=1 complete // 垂直方向完全并行访问
 
-    for (int ch = 0; ch < c; ch++) {
-        for (int h = 0; h < out_h; h++) {
-            for (int w = 0; w < out_w; w++) {
-                
+    // Window Buffer 存储当前的 KxK 窗口
+    data_t window[K][K];
+    #pragma HLS ARRAY_PARTITION variable=window dim=0 complete // 完全寄存器化
+
+    // 2. 本地权重缓存 (以便并行访问)
+    int8_t local_weights[C][K][K];
+    #pragma HLS ARRAY_PARTITION variable=local_weights dim=0 complete
+
+    // 预取权重到本地寄存器/RAM
+    for(int c=0; c<C; c++) {
+        for(int kr=0; kr<K; kr++) {
+            for(int kc=0; kc<K; kc++) {
+                local_weights[c][kr][kc] = weight[c*K*K + kr*K + kc];
+            }
+        }
+    }
+
+    int out_h = IN_H - K + 1;
+    int out_w = IN_W - K + 1;
+
+    // 3. 逐通道处理 (Block 1 C=3 较小，可以选择不展开通道循环以节省资源，或者展开以进一步加速)
+    // 鉴于 K=9 非常大 (81次乘法)，为了节省 DSP，我们对 Channel 串行处理，对 Kernel 并行处理。
+    // Block 1: 3 Channel * 128*128 Pixels. 
+    // 优化后 Latency 约为 3 * 16384 = 49152 cycle，远小于 11M。
+    for (int ch = 0; ch < C; ch++) {
+        
+        // 图像遍历循环
+        // 使用 PIPELINE II=1，目标是每周期处理一个像素
+        // Flatten loop: 将行和列循环合并
+        Loop_Pixels: for (int i = 0; i < IN_H * IN_W; i++) {
+            #pragma HLS PIPELINE II=1
+
+            int row = i / IN_W;
+            int col = i % IN_W;
+
+            // 读取新像素
+            data_t new_pixel = input[ch * IN_H * IN_W + i];
+
+            // --- 更新 Line Buffer 和 Window ---
+            
+            // 临时列向量，用于从 Line Buffer 读出并推入 Window
+            data_t col_vec[K];
+            #pragma HLS ARRAY_PARTITION variable=col_vec complete
+
+            // 1. 准备当前列的数据：上方 K-1 个来自 Line Buffer，最下方 1 个是新像素
+            for (int k = 0; k < K - 1; k++) {
+                col_vec[k] = line_buffer[k][col];
+            }
+            col_vec[K-1] = new_pixel;
+
+            // 2. 更新 Line Buffer (向上移位的方式：LineBuf[k] = LineBuf[k+1])
+            // 实际上是将 col_vec[k+1] 存入 line_buffer[k]
+            for (int k = 0; k < K - 1; k++) {
+                line_buffer[k][col] = col_vec[k+1];
+            }
+
+            // 3. 更新 Window (向左滑动)
+            for (int r = 0; r < K; r++) {
+                for (int c = 0; c < K - 1; c++) {
+                    window[r][c] = window[r][c+1];
+                }
+                // 将新的一列填入 Window 最右侧
+                window[r][K-1] = col_vec[r];
+            }
+
+            // --- 计算卷积 (仅在有效窗口位置) ---
+            // 有效输出条件: 已经收集了足够的行和列
+            if (row >= K - 1 && col >= K - 1) {
                 acc_t acc = 0;
                 
-                for (int kh = 0; kh < k; kh++) {
-                    for (int kw = 0; kw < k; kw++) {
-                        // NCHW 地址计算
-                        int idx_in = (ch * in_h * in_w) + ((h + kh) * in_w) + (w + kw);
-                        int idx_w  = (ch * k * k) + (kh * k + kw);
-                        
-                        acc_t in_val = (acc_t)(ap_uint<8>)input[idx_in] - (acc_t)(ap_uint<8>)zp_in;
-                        acc_t w_val  = (acc_t)(weight[idx_w]) - (acc_t)(weight_zp);
+                // 完全并行的乘加树 (KxK)
+                // HLS 会自动将其映射为并行 DSP/LUT 计算
+                Calc_Loop: for (int kr = 0; kr < K; kr++) {
+                    for (int kc = 0; kc < K; kc++) {
+                        acc_t in_val = (acc_t)(ap_uint<8>)window[kr][kc] - (acc_t)(ap_uint<8>)zp_in;
+                        acc_t w_val  = (acc_t)local_weights[ch][kr][kc] - (acc_t)weight_zp;
                         acc += in_val * w_val;
                     }
                 }
+
+                // 计算输出索引并写回
+                int out_r = row - (K - 1);
+                int out_c = col - (K - 1);
+                int idx_out = (ch * out_h * out_w) + (out_r * out_w + out_c);
                 
-                // Requantize (含加 Bias，此处 bias[ch] 为 0)
-                int idx_out = (ch * out_h * out_w) + (h * out_w + w);
                 output[idx_out] = requantize(acc, bias[ch], mult[ch], shift[ch], zp_out);
             }
         }
@@ -262,9 +329,9 @@ void litenet(ap_int<32> input_packed[3*128*128/4], ap_int<32> output_packed[12/4
     // ================= Block 1 =================
     // Depthwise: 3x128x128 -> 3x120x120 (k=9)
     // 传入 block1_depthwise_bias_int32 (全0)
-    depthwise_conv(input_local, buf1, block1_depthwise_weights, block1_depthwise_bias_int32, 
+    depthwise_conv_opt<128, 128, 3, 9>(input_local, buf1, block1_depthwise_weights, block1_depthwise_bias_int32, 
                    block1_depthwise_mult, block1_depthwise_shift, block1_depthwise_zp_out, 
-                   128, 128, 3, 9, INPUT_ZP, 0);
+                   INPUT_ZP, 0);
 
     #ifndef __SYNTHESIS__
     printf("=== Block 1 Depthwise Output (3x120x120) ===\n");
@@ -304,9 +371,9 @@ void litenet(ap_int<32> input_packed[3*128*128/4], ap_int<32> output_packed[12/4
     // ================= Block 2 =================
     // Depthwise: 16x30x30 -> 16x26x26 (k=5)
     // Input ZP 来自上一层 Block1 Pointwise 的输出 ZP
-    depthwise_conv(buf3, buf4, block2_depthwise_weights, block2_depthwise_bias_int32,
+    depthwise_conv_opt<30, 30, 16, 5>(buf3, buf4, block2_depthwise_weights, block2_depthwise_bias_int32,
                    block2_depthwise_mult, block2_depthwise_shift, block2_depthwise_zp_out,
-                   30, 30, 16, 5, block1_pointwise_zp_out, 0);
+                   block1_pointwise_zp_out, 0);
 
     #ifndef __SYNTHESIS__
     printf("=== Block 2 Depthwise Output (16x26x26) ===\n");
@@ -346,9 +413,9 @@ void litenet(ap_int<32> input_packed[3*128*128/4], ap_int<32> output_packed[12/4
 
     // ================= Block 3 =================
     // Depthwise: 32x8x8 -> 32x3x3 (k=6)
-    depthwise_conv(buf6, buf7, block3_depthwise_weights, block3_depthwise_bias_int32,
+    depthwise_conv_opt<8, 8, 32, 6>(buf6, buf7, block3_depthwise_weights, block3_depthwise_bias_int32,
                    block3_depthwise_mult, block3_depthwise_shift, block3_depthwise_zp_out,
-                   8, 8, 32, 6, block2_pointwise_zp_out, 0);
+                   block2_pointwise_zp_out, 0);
 
     #ifndef __SYNTHESIS__
     printf("=== Block 3 Depthwise Output (32x3x3) ===\n");
